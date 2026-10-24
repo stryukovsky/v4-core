@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Rust: backend",
+      "type": "codelldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/backend",
+      "cwd": "${workspaceFolder}",
+      "args": [],
+      "envFile": "${workspaceFolder}/.env",
+      "stopOnEntry": false
+    }
+  ]
+}

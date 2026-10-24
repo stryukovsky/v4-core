@@ -1,0 +1,60 @@
+/home/dmitry/Work/v4-core
+swap of tokens
+src/types/PoolKey.sol:11
+Identify the pool by its ordered currency0 and currency1 addresses, fee, tick spacing, and hook contract. Currency address zero means native ETH. These five fields together identify a pool; the token pair alone is insufficient.
+src/PoolManager.sol:117
+Prerequisite: initialize this pool with a valid starting sqrt price. Initialization checks currency ordering, tick spacing, hook configuration, and fees. Liquidity providers must separately add and settle liquidity through modifyLiquidity; initialization alone supplies no tokens or liquidity for a useful trade.
+src/types/PoolOperation.sol:19
+Choose the swap request. zeroForOne=true sells currency0 for currency1 and moves price down; false reverses both. Negative amountSpecified requests exact input including fees, positive requests exact output. sqrtPriceLimitX96 is the stopping sqrt(currency1/currency0 raw-unit price), scaled by 2^96; it is not an output-minimum check.
+src/test/PoolSwapTest.sol:35
+Follow this test router as a concrete single-swap example. The caller must fund native input with msg.value or provide ERC20 balance and allowance to this router, or authorize spending ERC-6909 claims when settling by burn. The router encodes the original sender, request, settings, and hook data, then calls manager.unlock. This helper contains test assertions and is not a production router.
+src/PoolManager.sol:104
+unlock rejects a nested unlock with AlreadyUnlocked, sets the transient unlock flag, and calls unlockCallback on its immediate caller, here the router. The callback must perform the swap and clear all outstanding currency deltas before returning. The unlock flag allows callback operations; it does not prohibit every nested manager operation.
+src/test/PoolSwapTest.sol:48
+The callback accepts only the manager, decodes the request, and asserts that this router starts with zero deltas for both currencies. It calls manager.swap; inside the manager msg.sender is the router, while the original payer remains in decoded callback data.
+src/PoolManager.sol:187
+swap requires an unlocked manager and disallows delegatecall. It rejects zero amountSpecified, hashes the full pool key to select state, and checks that the pool was initialized. Calling swap directly while locked fails with ManagerLocked; providing a different key selects a different pool rather than changing an existing pool.
+src/libraries/Hooks.sol:248
+beforeSwap dispatches only when the hook address permission flags enable it, and skips self-calls from the hook. Hook calls validate the response selector and this callback requires 96 returned bytes. Dynamic-fee pools may accept a flagged LP fee override. Permissioned specified deltas adjust amountToSwap, but changing its sign reverts with HookDeltaExceedsSwapAmount; reducing it to zero is allowed.
+src/PoolManager.sol:206
+The manager passes the hook-adjusted amount, direction, tick spacing, price limit, and fee override into _swap. It also selects the input currency for protocol fee accounting. No ERC20 or ETH transfer happens in this core swap call.
+src/libraries/Pool.sol:283
+Load current price, tick, active liquidity, and the direction-specific protocol fee. Track amountSpecifiedRemaining and amountCalculated in memory. Select the stored LP fee or validated override and combine protocol and LP fees sequentially in millionths: protocolFee + lpFee - floor(protocolFee*lpFee/1,000,000). Exact output with a total fee of 100% reverts with InvalidFeeForExactOut.
+src/libraries/Pool.sol:320
+A hook-adjusted zero amount returns a zero core delta without moving price. Otherwise a zeroForOne limit must be strictly below current price and strictly above MIN_SQRT_PRICE; the opposite direction requires a limit strictly above current price and below MAX_SQRT_PRICE. Invalid limits revert with PriceLimitAlreadyExceeded or PriceLimitOutOfBounds.
+src/libraries/Pool.sol:344
+Loop until the requested amount is consumed or the price limit is reached. The tick bitmap searches one word at a time, so its next boundary need not be initialized. Clamp the boundary to the supported tick range, convert it to a sqrt price, and choose the nearer of that boundary and the user limit. Empty liquidity ranges can be traversed without exchanging tokens.
+src/libraries/SwapMath.sol:51
+Compute a single price step using active liquidity. For exact input, deduct the fee budget and either reach the target or exhaust available input. For exact output, cap output by the remaining request and derive required input plus fee. SqrtPriceMath rounds input requirements upward and output downward, while fee calculations round upward where needed; integer rounding affects the actual trade amounts.
+src/libraries/Pool.sol:370
+For exact output, subtract output from the positive remainder and accumulate input plus fees as a negative calculated amount. For exact input, add spent input plus fees toward the negative remainder reaching zero and accumulate positive output. Reaching the price limit can end either kind of swap with a partial fill; the core does not require the full requested output.
+src/libraries/Pool.sol:385
+Split the input-currency fee between protocol and LPs. Accumulate amountToProtocol and increase global LP fee growth by the remaining fee divided by active liquidity, scaled by 2^128. This records LP entitlement for later position accounting; it does not transfer fees to LP wallets now.
+src/libraries/Pool.sol:413
+When a step reaches an initialized tick, crossTick updates fee-growth-outside accounting and returns net liquidity. Reverse that net sign for zeroForOne, then adjust active liquidity for the next range. Moving left sets tick to tickNext-1; otherwise use tickNext. Within a range, derive the tick from the resulting sqrt price and continue the loop.
+src/libraries/Pool.sol:439
+Persist the final price, tick, active liquidity, and input-currency fee growth. Build BalanceDelta from actual consumed and calculated amounts, ordered as currency0 and currency1 regardless of direction. Each component is a signed int128: negative means the caller owes the manager, positive means the manager owes the caller; checked casts reject amounts that do not fit.
+src/PoolManager.sol:234
+After pool.swap returns, accrue protocol fees in the input currency and emit Swap with core amounts, final price, liquidity, tick, and total fee. The sender is the router. This event precedes afterSwap and therefore its core amounts may differ from the final caller delta after hook adjustments.
+src/libraries/Hooks.sol:285
+afterSwap optionally invokes the hook and accepts an unspecified-currency delta only with the return-delta permission. Combine this with the beforeSwap deltas, map specified and unspecified amounts to the two currencies, and subtract hookDelta from the caller delta. Hooks can add calls and side effects; invalid responses, hook failures, or arithmetic overflow revert the operation.
+src/PoolManager.sol:220
+Account the hook delta to the hook address and the final swap delta to msg.sender, the router. Hook balances are separate obligations; the router settling its own balances does not automatically settle a hook debt or credit. The returned BalanceDelta describes the caller result after hook adjustments.
+src/libraries/CurrencyDelta.sol:28
+Currency deltas live in manager transient storage keyed by account and currency. applyDelta adds each change to the prior balance. PoolManager._accountDelta updates NonzeroDeltaCount only when a balance enters or leaves zero, allowing several operations to net obligations before actual token movement.
+src/test/PoolSwapTest.sol:61
+Read the router deltas after the swap and assert direction and amount relationships for exact input/output. These helper assertions permit partial fills. A production integration needs its own minimum-output, maximum-input, full-fill, deadline, and payer authorization checks as appropriate; PoolManager does not provide these router policies.
+src/test/PoolSwapTest.sol:102
+Settle every negative router delta from the original payer and consume every positive router delta for that payer. TestSettings chooses actual token transfers versus burning existing claims for input and minting claims for output. The helper returns the final swap delta only after these operations.
+test/utils/CurrencySettler.sol:19
+For ERC20 input, sync snapshots the manager balance before transferFrom(payer, manager, amount), then settle measures the increase. The allowance must authorize the router. Native input calls settle with value from the router balance; burning claims instead calls manager.burn and requires authorization. This helper does not check the ERC20 boolean return, so a failed payment normally surfaces through transfer failure or the final unsettled-delta check.
+src/PoolManager.sol:349
+_settle credits the recipient by actual payment: msg.value for native currency or the increase over synced ERC20 reserves. ERC20 settlement rejects nonzero msg.value and resets the synced currency. sync must precede the token transfer so the increase is measurable. The manager recommends syncing native currency too; the test helper assumes the synced currency is already zero for its native branch.
+test/utils/CurrencySettler.sol:43
+For output, manager.take decreases the router credit and transfers the actual currency to the recipient. With takeClaims=true, manager.mint consumes that credit and gives the recipient ERC-6909 claims instead, leaving underlying currency in manager custody. Transfer failures revert; claims are not an immediate underlying-token payout.
+src/PoolManager.sol:112
+Once the callback returns, every outstanding account/currency delta must be zero, including hook deltas. Otherwise CurrencyNotSettled reverts the unlock call and its nested swaps, storage changes, transfers, and logs. On success the manager locks again and returns the encoded callback result.
+src/test/PoolSwapTest.sol:40
+The outer router decodes BalanceDelta and refunds its entire remaining ETH balance to the original caller. That can include ETH already held by this test router, another reason not to deploy it as a production router. A failed refund reverts this router call, including the completed unlock and swap.
+test/PoolManager.swap.t.sol:139
+Existing behavioral reference: test_shouldSwapEqual initializes matching v3 and v4 pools, adds liquidity, executes swaps, and asserts zero differences for both token amounts. The adjacent multiple-LP variant extends coverage across positions. These tests illustrate core swap equivalence; they do not by themselves establish production router safety or every hook behavior.

@@ -1,78 +1,88 @@
-use alloy::{
-    network::EthereumWallet,
-    primitives::{Address, Bytes, I256, U160, U256, aliases::I24},
-    providers::{Provider, ProviderBuilder},
-    signers::local::PrivateKeySigner,
-    sol,
-};
-use eyre::Result;
-use reqwest::Url;
-use tokio::try_join;
+mod config;
+mod eth;
+mod routes;
+mod rpc;
 
-use crate::MySwapper::{PoolKey, SwapParams};
+use std::time::Duration;
 
-sol!(
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    ERC20,
-    "abi/ERC20.json"
-);
+use eyre::{Result, WrapErr};
+use jsonrpsee::server::{ServerBuilder, ServerConfig, stop_channel};
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use tracing_subscriber::EnvFilter;
 
-sol!(
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MySwapper,
-    "abi/MySwapper.json"
-);
+#[derive(Clone)]
+pub struct AppState {
+    pub db: PgPool,
+    pub private_key: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rpc_url: Url = "http://localhost:8545".parse()?;
-    let pool_manager_address: Address = "0x000000000004444c5dc75cB358380D2e3dE08A90".parse()?;
-    let usdt_address: Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse()?;
+    let config = config::Config::load()?;
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
 
-    let private_key_mock: PrivateKeySigner =
-        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".parse()?;
-    let signer_address = private_key_mock.address();
-    let wallet = EthereumWallet::new(private_key_mock);
+    let db = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&config.database_url)
+        .await
+        .wrap_err("failed to connect to PostgreSQL")?;
 
-    let provider = ProviderBuilder::new().wallet(wallet).connect_http(rpc_url);
+    sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/sql/create"
+    )))
+    .await?
+    .run(&db)
+    .await
+    .wrap_err("failed to run database migrations")?;
 
-    let my_swapper = MySwapper::deploy(&provider, pool_manager_address).await?;
-    let usdt = ERC20::new(usdt_address, &provider);
-    let eth_usdt_pool_key = PoolKey {
-        currency0: Address::ZERO,
-        currency1: usdt_address,
-        fee: 3000.try_into()?,
-        tickSpacing: I24::try_from(60)?,
-        hooks: Address::ZERO,
+    let state = AppState {
+        db: db.clone(),
+        private_key: config.private_key,
     };
-
-    let native_balance_before = provider.get_balance(signer_address).await?;
-    println!("Before {} ETH", native_balance_before);
-
-    let eth_input = U256::from(100_000_000_000_000_000u64); // 0.1 ETH in wei
-    // Fund the native currency input used by the swapper's unlock callback.
-    my_swapper
-        .swap(
-            eth_usdt_pool_key,
-            SwapParams {
-                zeroForOne: true,
-                amountSpecified: -I256::try_from(eth_input)?, // negative means exact input
-                sqrtPriceLimitX96: U160::from(4_295_128_740u64), // MIN_SQRT_PRICE + 1 for zeroForOne
-            },
-            Bytes::new(),
-        )
-        .value(eth_input)
-        .send_sync()
+    let (stop, handle) = stop_channel();
+    let service = ServerBuilder::default()
+        .set_config(ServerConfig::builder().http_only().build())
+        .to_service_builder()
+        .build(rpc::module(state.clone()), stop);
+    let service = axum::error_handling::HandleError::new(service, |_: axum::BoxError| async {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    });
+    let app = routes::router(state).route_service("/rpc", service);
+    let listener = tokio::net::TcpListener::bind(config.api_addr).await?;
+    tracing::info!(address = %listener.local_addr()?, "HTTP API and JSON-RPC listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = handle.stop();
+        })
         .await?;
-
-    let native_balance_after = provider.get_balance(signer_address).await?;
-    let decimals_usdt_await = usdt.decimals();
-    let usdt_balance_await = usdt.balanceOf(signer_address);
-    let results = try_join!(decimals_usdt_await.call(), usdt_balance_await.call())?;
-
-    println!("{} ETH, {} USDT", native_balance_after, results.1 / alloy::primitives::U256::from(results.0));
-
+    db.close().await;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    tracing::info!("shutting down");
 }

@@ -17,6 +17,8 @@ import {Currency} from "../../src/types/Currency.sol";
 import {BalanceDelta} from "../../src/types/BalanceDelta.sol";
 import {SafeCast} from "../../src/libraries/SafeCast.sol";
 import {SwapMath} from "../../src/libraries/SwapMath.sol";
+import {FullMath} from "../../src/libraries/FullMath.sol";
+import {StateLibrary} from "../../src/libraries/StateLibrary.sol";
 
 contract CustomAccountingTest is Test, Deployers {
     using SafeCast for *;
@@ -76,7 +78,6 @@ contract CustomAccountingTest is Test, Deployers {
     // ------------------------ SWAP  ------------------------
 
     function test_swap_afterSwapFeeOnUnspecified_exactInput() public {
-        _setUpFeeTakingPool();
         uint256 balanceBefore0 = currency0.balanceOf(address(this));
         uint256 balanceBefore1 = currency1.balanceOf(address(this));
 
@@ -116,6 +117,41 @@ contract CustomAccountingTest is Test, Deployers {
         assertEq(currency1.balanceOf(address(this)), balanceBefore1 + (998 - 12), "amount 1");
     }
 
+    /// @notice Token1 per token0, scaled by 1e18 and rounded down.
+    /// @dev Supports decimal differences up to 18, including common 6/18 decimal pairs.
+    function sqrtPrice2Human(uint160 price, uint256 decimals0, uint256 decimals1) public pure returns (uint256) {
+        uint256 difference = decimals0 >= decimals1 ? decimals0 - decimals1 : decimals1 - decimals0;
+        require(difference <= 18, "decimal difference exceeds 18");
+        uint256 scale = decimals0 >= decimals1 ? 10 ** (18 + difference) : 10 ** (18 - difference);
+
+        if (price <= type(uint128).max) {
+            return FullMath.mulDiv(uint256(price) * price, scale, uint256(1) << 192);
+        }
+
+        // Keep the squared ratio in 256 bits for large sqrt prices.
+        uint256 ratioX128 = FullMath.mulDiv(price, price, uint256(1) << 64);
+        return FullMath.mulDiv(ratioX128, scale, uint256(1) << 128);
+    }
+
+    function test_sqrtPrice2Human() public pure {
+        uint160 one = uint160(1) << 96;
+        assertEq(sqrtPrice2Human(one, 18, 18), 1e18);
+        assertEq(sqrtPrice2Human(one / 2, 18, 18), 0.25e18);
+        assertEq(sqrtPrice2Human(one * 2, 18, 18), 4e18);
+        assertEq(sqrtPrice2Human(one, 18, 6), 1e30);
+        assertEq(sqrtPrice2Human(one, 6, 18), 1e6);
+        assertEq(sqrtPrice2Human(0, 18, 18), 0);
+        assertEq(sqrtPrice2Human(1, 18, 18), 0);
+        assertEq(sqrtPrice2Human(uint160(1) << 129, 18, 18), (uint256(1) << 66) * 1e18);
+    }
+
+    function test_sqrtPrice2Human_revertsForUnsupportedDecimalDifference() public {
+        vm.expectRevert("decimal difference exceeds 18");
+        this.sqrtPrice2Human(SQRT_PRICE_1_1, 19, 0);
+        vm.expectRevert("decimal difference exceeds 18");
+        this.sqrtPrice2Human(SQRT_PRICE_1_1, 0, 19);
+    }
+
     function test_swap_afterSwapFeeOnUnspecified_exactOutput() public {
         _setUpFeeTakingPool();
 
@@ -133,11 +169,7 @@ contract CustomAccountingTest is Test, Deployers {
         // plus a fee of 1.23% on unspecified (input) => (1002*123)/10000 = 12
         // This small swap stays within the initial liquidity range.
         uint128 liquidity = uint128(uint256(LIQUIDITY_PARAMS.liquidityDelta));
-        (,
-            uint256 calculatedAmountIn,
-            uint256 calculatedAmountOut,
-            uint256 calculatedPoolFee
-        ) = SwapMath.computeSwapStep(
+        (, uint256 calculatedAmountIn, uint256 calculatedAmountOut, uint256 calculatedPoolFee) = SwapMath.computeSwapStep(
             SQRT_PRICE_1_1, params.sqrtPriceLimitX96, liquidity, params.amountSpecified, key.fee
         );
         uint256 calculatedInputBeforeHookFee = calculatedAmountIn + calculatedPoolFee;
@@ -145,7 +177,9 @@ contract CustomAccountingTest is Test, Deployers {
         uint256 calculatedHookFee = calculatedInputBeforeHookFee * hookFeeBips / FeeTakingHook(hook).TOTAL_BIPS();
 
         emit log_named_uint("pool fee (pips, denominator 1000000)", key.fee);
-        emit log_named_uint("starting sqrt price (Q64.96)", SQRT_PRICE_1_1);
+        // Deployers creates both test tokens with 18 decimals.
+        uint256 priceBefore = sqrtPrice2Human(SQRT_PRICE_1_1, 18, 18);
+        emit log_named_decimal_uint("starting price (token1 per token0)", priceBefore, 18);
         emit log_named_uint("active liquidity", liquidity);
         emit log_named_uint("specified output amount", amountToSwap);
         emit log_named_uint("calculated input excluding pool fee", calculatedAmountIn);
@@ -157,6 +191,13 @@ contract CustomAccountingTest is Test, Deployers {
         emit log_named_uint("calculated total input", calculatedInputBeforeHookFee + calculatedHookFee);
         emit log_named_uint("currency0 spent", balanceBefore0 - currency0.balanceOf(address(this)));
         emit log_named_uint("currency1 received", currency1.balanceOf(address(this)) - balanceBefore1);
+        (uint160 sqrtPriceAfterX96,,,) = StateLibrary.getSlot0(manager, key.toId());
+        uint256 priceAfter = sqrtPrice2Human(sqrtPriceAfterX96, 18, 18);
+        emit log_named_decimal_uint("price after swap (token1 per token0)", priceAfter, 18);
+        // Approximate average execution impact, excluding fees, for this token0 -> token1 swap.
+        // Combine divisions to preserve precision: ((priceBefore - priceAfter) / 2) / priceBefore * 100.
+        uint256 estimatedImpactPercent = FullMath.mulDiv(priceBefore - priceAfter, 100 * 1e18, priceBefore);
+        emit log_named_decimal_uint("estimated price impact (%)", estimatedImpactPercent, 18);
         assertEq(currency0.balanceOf(address(this)), balanceBefore0 - 1002 - 12, "amount 0");
         assertEq(currency1.balanceOf(address(this)), balanceBefore1 + amountToSwap, "amount 1");
     }

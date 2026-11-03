@@ -16,6 +16,9 @@ contract MySwapper is IUnlockCallback {
 
     IPoolManager public immutable poolManager;
 
+    /// @notice Final caller deltas, including any hook accounting adjustments.
+    event SwapExecuted(address indexed sender, int256 delta);
+
     struct CallbackData {
         address sender;
         PoolKey key;
@@ -41,6 +44,7 @@ contract MySwapper is IUnlockCallback {
         );
         // Refund only this call's unused value, rather than the contract's entire balance.
         if (msg.value > nativeSpent) CurrencyLibrary.ADDRESS_ZERO.transfer(msg.sender, msg.value - nativeSpent);
+        emit SwapExecuted(msg.sender, BalanceDelta.unwrap(delta));
     }
 
     function unlockCallback(bytes calldata rawData) external override returns (bytes memory) {

@@ -8,6 +8,7 @@ import {IERC20Minimal} from "../src/interfaces/external/IERC20Minimal.sol";
 import {Currency} from "../src/types/Currency.sol";
 import {BalanceDelta} from "../src/types/BalanceDelta.sol";
 import {SwapParams} from "../src/types/PoolOperation.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 contract MySwapperTest is Deployers {
     MySwapper internal swapper;
@@ -24,7 +25,9 @@ contract MySwapperTest is Deployers {
         vm.deal(address(swapper), 1 ether);
         uint256 ethBefore = address(this).balance;
         uint256 tokenBefore = currency1.balanceOf(address(this));
+        vm.recordLogs();
         BalanceDelta delta = swapper.swap{value: 0.1 ether}(nativeKey, SwapParams(true, -1e12, MIN_PRICE_LIMIT), "");
+        assertReceiptDelta(delta);
         assertLt(delta.amount0(), 0);
         assertGt(delta.amount1(), 0);
         assertEq(ethBefore - address(this).balance, uint256(-int256(delta.amount0())));
@@ -35,7 +38,9 @@ contract MySwapperTest is Deployers {
     function testErc20InputAndNativeOutput() public {
         uint256 ethBefore = address(this).balance;
         uint256 tokenBefore = currency1.balanceOf(address(this));
+        vm.recordLogs();
         BalanceDelta delta = swapper.swap(nativeKey, SwapParams(false, -1e12, MAX_PRICE_LIMIT), "");
+        assertReceiptDelta(delta);
         assertGt(delta.amount0(), 0);
         assertLt(delta.amount1(), 0);
         assertEq(address(this).balance - ethBefore, uint128(delta.amount0()));
@@ -45,6 +50,15 @@ contract MySwapperTest is Deployers {
     function testRejectUnauthorizedCallback() public {
         vm.expectRevert("Only manager");
         swapper.unlockCallback("");
+    }
+
+    function assertReceiptDelta(BalanceDelta delta) internal {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        Vm.Log memory execution = logs[logs.length - 1];
+        assertEq(execution.emitter, address(swapper));
+        assertEq(execution.topics[0], keccak256("SwapExecuted(address,int256)"));
+        assertEq(execution.topics[1], bytes32(uint256(uint160(address(this)))));
+        assertEq(abi.decode(execution.data, (int256)), BalanceDelta.unwrap(delta));
     }
 
     function testCannotSpendExistingEthBalance() public {

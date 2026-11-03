@@ -1,12 +1,11 @@
 mod config;
 mod eth;
-mod routes;
 mod rpc;
 
 use std::time::Duration;
 
 use eyre::{Result, WrapErr};
-use jsonrpsee::server::{ServerBuilder, ServerConfig, stop_channel};
+use jsonrpsee::server::{ServerBuilder, ServerConfig};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing_subscriber::EnvFilter;
 
@@ -41,25 +40,19 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         db: db.clone(),
+        // Moves String ownership (pointer, length, capacity) into AppState, reusing
+        // its heap buffer without allocating. config.private_key is moved from.
         private_key: config.private_key,
     };
-    let (stop, handle) = stop_channel();
-    let service = ServerBuilder::default()
+    let server = ServerBuilder::default()
         .set_config(ServerConfig::builder().http_only().build())
-        .to_service_builder()
-        .build(rpc::module(state.clone()), stop);
-    let service = axum::error_handling::HandleError::new(service, |_: axum::BoxError| async {
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    });
-    let app = routes::router(state).route_service("/rpc", service);
-    let listener = tokio::net::TcpListener::bind(config.api_addr).await?;
-    tracing::info!(address = %listener.local_addr()?, "HTTP API and JSON-RPC listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = handle.stop();
-        })
+        .build(config.api_addr)
         .await?;
+    tracing::info!(address = %server.local_addr()?, "JSON-RPC listening");
+    let handle = server.start(rpc::module(state));
+    shutdown_signal().await;
+    handle.stop()?;
+    handle.stopped().await;
     db.close().await;
     Ok(())
 }

@@ -1,0 +1,36 @@
+@baseUrl = http://127.0.0.1:3000
+
+### Deploy a swapper on Ethereum mainnet if this pool has none yet.
+# Load fixtures first and configure RPC_URL for mainnet (chain ID 1).
+# Running this request spends ETH for deployment from the configured PRIVATE_KEY.
+POST {{baseUrl}}/rpc
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "deploy_swapper",
+  "params": {
+    "chain_id": 1
+  }
+}
+
+### Swap 0.001 native ETH (1,000,000,000,000,000 wei) to USDT.
+# PoolManager: 0x000000000004444c5dc75cB358380D2e3dE08A90
+# Uniswap v4: fee 3000 (0.3%), tick spacing 60, no hooks.
+# The configured signer pays input and gas and receives USDT.
+POST {{baseUrl}}/rpc
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "swap",
+  "params": {
+    "chain_id": 1,
+    "pool_id": "0x50b00c1a5a8e582ec808e97e71598cd135206a9f9c548eab2ed73659e7ee5fa8",
+    "input_token": "0x0000000000000000000000000000000000000000",
+    "output_token": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "input_amount": "1000000000000000"
+  }
+}
